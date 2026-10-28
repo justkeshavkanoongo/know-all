@@ -75,6 +75,43 @@ def test_unknown_course_slug_returns_predictable_404() -> None:
     }
 
 
+def test_quest_api_without_database_configuration_returns_safe_503(monkeypatch) -> None:
+    from app.database import dispose_engine
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    dispose_engine()
+    with TestClient(app, raise_server_exceptions=False) as unconfigured_client:
+        response = unconfigured_client.post(
+            "/api/quests",
+            json={"lesson_id": "german-a1-greetings", "concept_ids": ["german-greetings"], "template_id": "concept-guide-v1"},
+            headers={"Origin": "http://localhost:3000", "Idempotency-Key": "unconfigured-test"},
+        )
+    assert response.status_code == 503
+    assert response.json() == {"code": "database_unavailable", "message": "The quest service is not configured."}
+
+
+def test_quest_contract_is_registered_in_openapi() -> None:
+    from app.main import app
+
+    schema = app.openapi()
+    paths = schema["paths"]
+    assert {"post"} <= paths["/api/guest-sessions"].keys()
+    assert "post" in paths["/api/quests"]
+    assert "get" in paths["/api/quests/{quest_id}"]
+    assert "post" in paths["/api/quests/{quest_id}/invitations"]
+    assert "delete" in paths["/api/quests/{quest_id}/invitations"]
+    assert "post" in paths["/api/quest-invitations/redeem"]
+    schemas = schema["components"]["schemas"]
+    assert "QuestCreate" in schemas and "QuestResponse" in schemas
+    assert "InvitationRedeem" in schemas and "ErrorResponse" in schemas
+    assert "get" in paths["/api/quests/{quest_id}/preparation"]
+    assert "post" in paths["/api/quests/{quest_id}/preparation/check"]
+    assert "get" in paths["/api/quests/{quest_id}/artifact"]
+    assert "patch" in paths["/api/quests/{quest_id}/artifact/sections/{section_id}"]
+    assert "PreparationStatus" in schemas and "ArtifactResponse" in schemas
+    assert "ArtifactSectionUpdate" in schemas and "ArtifactRevisionResponse" in schemas
+
+
 def test_german_a1_greetings_lesson_is_complete_and_stable() -> None:
     response = client.get("/api/lessons/german-a1-greetings")
 

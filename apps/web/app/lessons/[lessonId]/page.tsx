@@ -3,6 +3,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { LessonLearningExperience } from "@/components/lesson-learning-experience";
+import { StartQuestButton } from "@/components/quest-controls";
 import { getLesson } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -55,6 +56,7 @@ export default async function LessonPage({ params }: LessonPageProps) {
         <Link className="ml-5 mt-5 inline-flex rounded-sm font-semibold text-navy underline decoration-sage underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sage" href="#assessment">
           Jump to assessment ↓
         </Link>
+        <StartQuestButton />
       </header>
 
       <section aria-labelledby="vocabulary-heading" className="border-b border-line py-10 sm:py-12">

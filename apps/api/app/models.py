@@ -57,3 +57,4 @@ class CourseDetail(CourseBase):
 class ApiError(ApiModel):
     code: str
     message: str
+    current_revision: int | None = None

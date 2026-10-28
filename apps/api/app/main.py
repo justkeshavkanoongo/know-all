@@ -3,6 +3,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from sqlalchemy.exc import SQLAlchemyError
 
 from .catalog import get_course_by_slug, list_course_summaries
 from .assessment_models import (
@@ -28,12 +29,26 @@ from .practice import (
     get_practice_set,
 )
 from .practice_models import PracticeCheckRequest, PracticeCheckResponse, PracticeSet
+from .quests import router as quest_router
+from .database import DatabaseConfigurationError
 
 app = FastAPI(
     title="Know It All API",
     version="1.0.0",
     description="A small, typed API for the Know It All course catalog.",
 )
+app.include_router(quest_router)
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_unavailable(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+    # Never return connection details or SQL to clients.
+    return JSONResponse(status_code=503, content={"code": "database_unavailable", "message": "The quest service is temporarily unavailable."})
+
+
+@app.exception_handler(DatabaseConfigurationError)
+async def database_not_configured(request: Request, exc: DatabaseConfigurationError) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"code": "database_unavailable", "message": "The quest service is not configured."})
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -42,7 +57,7 @@ async def predictable_http_errors(
 ) -> JSONResponse:
     if isinstance(exc.detail, dict) and "code" in exc.detail and "message" in exc.detail:
         error = ApiError.model_validate(exc.detail)
-        return JSONResponse(status_code=exc.status_code, content=error.model_dump())
+        return JSONResponse(status_code=exc.status_code, content=error.model_dump(exclude_none=True))
     return await http_exception_handler(request, exc)
 
 

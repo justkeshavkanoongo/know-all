@@ -13,6 +13,9 @@ import {
 
 type PracticePanelProps = {
   lessonId: string;
+  questId?: string;
+  completedEvidenceIds?: string[];
+  onQuestEvidence?: (exerciseId: string) => void;
   onValidatedOutcome?: (practice: PracticeSet, exercise: PracticeExercise, correct: boolean) => void;
 };
 
@@ -45,7 +48,7 @@ function isAnswerComplete(exercise: PracticeExercise, answer: PracticeAnswer | n
   return typeof answer === "string" && answer.trim().length > 0;
 }
 
-export function PracticePanel({ lessonId, onValidatedOutcome }: PracticePanelProps) {
+export function PracticePanel({ lessonId, questId, completedEvidenceIds = [], onQuestEvidence, onValidatedOutcome }: PracticePanelProps) {
   const [practice, setPractice] = useState<PracticeSet | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -70,6 +73,15 @@ export function PracticePanel({ lessonId, onValidatedOutcome }: PracticePanelPro
       });
     return () => { cancelled = true; };
   }, [lessonId]);
+
+  useEffect(() => {
+    if (!questId || !practice) return;
+    const next = practice.exercises.findIndex((item) => !completedEvidenceIds.includes(item.evidence_id));
+    const nextIndex = next < 0 ? practice.exercises.length : next;
+    setIndex(nextIndex);
+    setAnswer(null);
+    setFeedback(null);
+  }, [completedEvidenceIds, practice, questId]);
 
   const exercises = practice?.exercises ?? [];
   const exercise = exercises[index];
@@ -101,7 +113,10 @@ export function PracticePanel({ lessonId, onValidatedOutcome }: PracticePanelPro
     setSubmitting(true);
     setCheckError(null);
     try {
-      const response = await fetch(`/api/lessons/${encodeURIComponent(lessonId)}/practice/check`, {
+      const checkUrl = questId
+        ? `/api/quests/${encodeURIComponent(questId)}/preparation/check`
+        : `/api/lessons/${encodeURIComponent(lessonId)}/practice/check`;
+      const response = await fetch(checkUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ exercise_id: exercise.exercise_id, answer }),
@@ -115,7 +130,11 @@ export function PracticePanel({ lessonId, onValidatedOutcome }: PracticePanelPro
         setCheckError("The answer check response was not in the expected format.");
         return;
       }
-      if (practice) onValidatedOutcome?.(practice, exercise, payload.correct);
+      if (questId) {
+        if (payload.correct) onQuestEvidence?.(exercise.exercise_id);
+      } else if (practice) {
+        onValidatedOutcome?.(practice, exercise, payload.correct);
+      }
       setFeedback({ correct: payload.correct, message: payload.feedback });
     } catch {
       setCheckError("We couldn’t reach the practice service. Check your connection and try again.");
@@ -128,7 +147,8 @@ export function PracticePanel({ lessonId, onValidatedOutcome }: PracticePanelPro
   return (
     <section id="practice" aria-labelledby="practice-heading" className="border-t border-line py-10 sm:py-12">
       <p className="eyebrow">Try what you learned</p>
-      <h2 id="practice-heading" className="mt-2 font-display text-3xl font-medium text-ink">Practice</h2>
+      <h2 id="practice-heading" className="mt-2 font-display text-3xl font-medium text-ink">{questId ? "Quest preparation" : "Practice"}</h2>
+      {questId && <p className="mt-2 text-sm leading-6 text-muted">Each answer is checked by the API and recorded only for this signed-in quest member. Local progress does not count toward preparation.</p>}
       {loading && (
         <p className="mt-5 rounded-xl border border-line bg-surface p-5 text-sm text-muted" role="status" aria-live="polite">
           Loading reviewed exercises…
@@ -207,8 +227,8 @@ export function PracticePanel({ lessonId, onValidatedOutcome }: PracticePanelPro
             <div className="mt-5 rounded-xl border border-line bg-paper p-4" role={feedback.correct ? "status" : "alert"} aria-live="polite">
               <p className="font-semibold text-ink">{feedback.correct ? "Correct" : "Not quite"}</p>
               <p className="mt-1 text-sm leading-6 text-muted">{feedback.message}</p>
-              <button className="mt-4 rounded-sm bg-navy px-4 py-2.5 text-sm font-semibold text-white focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sage" onClick={() => resetCurrentExercise(index + 1)} type="button">
-                {index + 1 === exercises.length ? "Finish practice" : "Next exercise"}
+              <button className="mt-4 rounded-sm bg-navy px-4 py-2.5 text-sm font-semibold text-white focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sage" onClick={() => resetCurrentExercise(questId && !feedback.correct ? index : index + 1)} type="button">
+                {questId && !feedback.correct ? "Try this exercise again" : index + 1 === exercises.length ? "Finish practice" : "Next exercise"}
               </button>
             </div>
           )}

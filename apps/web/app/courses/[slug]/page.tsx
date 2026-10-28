@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { CoursePathway } from "@/components/course-pathway";
+import { LessonLink } from "@/components/lesson-link";
 import { getCourse } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -40,6 +41,14 @@ export default async function CoursePage({ params }: CoursePageProps) {
           <p className="text-sm text-muted">{course.level_count} levels · {course.module_count} representative modules</p>
         </div>
         <CoursePathway levels={course.levels} />
+        {course.slug === "german" && (
+          <div className="mt-6 rounded-2xl border border-line bg-surface p-5 sm:p-6">
+            <p className="eyebrow">Featured A1 lesson</p>
+            <h3 className="mt-2 font-display text-xl font-medium text-ink">Greetings and introducing yourself</h3>
+            <p className="mt-2 text-sm leading-6 text-muted">A reviewed lesson on greetings, names, formal address and short introductions.</p>
+            <LessonLink />
+          </div>
+        )}
       </section>
     </main>
   );

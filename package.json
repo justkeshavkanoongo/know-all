@@ -1,0 +1,13 @@
+{
+  "name": "know-it-all",
+  "private": true,
+  "packageManager": "pnpm@12.15.0",
+  "scripts": {
+    "dev:web": "pnpm --filter know-all-web dev",
+    "build:web": "pnpm --filter know-all-web build",
+    "start:web": "pnpm --filter know-all-web start",
+    "typecheck": "pnpm --filter know-all-web typecheck",
+    "test:api": ".venv/bin/python -m pytest -q apps/api/tests",
+    "api:dev": ".venv/bin/uvicorn app.main:app --app-dir apps/api --reload --host 127.0.0.1 --port 8000"
+  }
+}

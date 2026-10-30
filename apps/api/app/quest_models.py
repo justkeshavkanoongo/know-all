@@ -2,7 +2,9 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.models import ReviewableRevisionConflict
 
 
 class QuestRequestModel(BaseModel):
@@ -36,7 +38,7 @@ class QuestResponse(BaseModel):
     concept_ids: list[str]
     template_id: str
     participant_count: int
-    allowed_actions: list[Literal["view", "invite", "prepare", "edit_artifact"]]
+    allowed_actions: list[Literal["view", "invite", "prepare", "edit_artifact", "review"]]
     created_at: datetime
     expires_at: datetime
     version: int
@@ -52,6 +54,7 @@ class ErrorResponse(BaseModel):
     code: str
     message: str
     current_revision: int | None = None
+    current_reviewable_revision: ReviewableRevisionConflict | None = None
 
 
 class PreparationMemberStatus(BaseModel):
@@ -114,6 +117,7 @@ class ArtifactSectionUpdate(QuestRequestModel):
 
 
 class ArtifactRevisionResponse(BaseModel):
+    revision_id: UUID
     revision_number: int
     changed_section: ArtifactSection | None
     author_role: Literal["host", "collaborator", "system"]
@@ -127,3 +131,100 @@ class ArtifactResponse(BaseModel):
     snapshot: ArtifactSnapshot
     revisions: list[ArtifactRevisionResponse]
     history_truncated: bool
+
+
+ReviewRating = Literal["needs_work", "mostly_there", "clear"]
+
+
+class PeerReviewRequest(QuestRequestModel):
+    revision_id: UUID
+    rubric_version: Literal["peer-review-v1"] = "peer-review-v1"
+    conceptual_correctness: ReviewRating
+    explanation_clarity: ReviewRating
+    example_relevance: ReviewRating
+    misconception_correction: ReviewRating
+    follow_up_usefulness: ReviewRating
+    strength: str = Field(min_length=1, max_length=500)
+    improvement_suggestion: str = Field(min_length=1, max_length=500)
+    rationale: str = Field(min_length=1, max_length=500)
+
+    @field_validator("strength", "improvement_suggestion", "rationale")
+    @classmethod
+    def require_non_whitespace_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Feedback text must contain non-whitespace characters.")
+        return value
+
+    @model_validator(mode="after")
+    def check_total_written_feedback(self):
+        if len(self.strength) + len(self.improvement_suggestion) + len(self.rationale) > 1500:
+            raise ValueError("Review text must not exceed 1500 characters in total.")
+        return self
+
+
+class ReviewRevisionSummary(BaseModel):
+    revision_id: UUID
+    revision_number: int
+    author_role: Literal["host", "collaborator"]
+    created_at: datetime
+    snapshot: ArtifactSnapshot
+
+
+class PeerReviewResponse(BaseModel):
+    review_id: UUID
+    review_round: Literal[1] = 1
+    revision_id: UUID
+    revision_number: int
+    revision_is_current: bool
+    snapshot: ArtifactSnapshot
+    reviewer_role: Literal["host", "collaborator"]
+    recipient_role: Literal["host", "collaborator"]
+    rubric_version: Literal["peer-review-v1"]
+    conceptual_correctness: ReviewRating
+    explanation_clarity: ReviewRating
+    example_relevance: ReviewRating
+    misconception_correction: ReviewRating
+    follow_up_usefulness: ReviewRating
+    strength: str
+    improvement_suggestion: str
+    rationale: str
+    created_at: datetime
+    acknowledged_at: datetime | None = None
+    response_text: str | None = None
+    responded_at: datetime | None = None
+
+
+class QuestReviewStatus(BaseModel):
+    quest_id: UUID
+    current_role: Literal["host", "collaborator"]
+    state: Literal["awaiting_partner", "preparing", "collaborating", "expired", "cancelled"]
+    eligible: bool
+    submitted_by_you: bool
+    submitted_by_partner: bool
+    reviewable_revision: ReviewRevisionSummary | None = None
+    review_given: PeerReviewResponse | None = None
+    review_received: PeerReviewResponse | None = None
+
+
+class ReviewAcknowledgementRequest(QuestRequestModel):
+    pass
+
+
+class ReviewResponseRequest(QuestRequestModel):
+    response: str = Field(min_length=1, max_length=500)
+
+    @field_validator("response")
+    @classmethod
+    def require_non_whitespace_response(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Response must contain non-whitespace characters.")
+        return value
+
+
+class ReviewRecipientResponse(BaseModel):
+    review_id: UUID
+    acknowledged_at: datetime
+    response_text: str | None = None
+    responded_at: datetime | None = None

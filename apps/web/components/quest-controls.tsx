@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { QuestArtifactWorkspace, QuestPreparation } from "@/components/quest-learning";
+import { QuestReviewWorkspace } from "@/components/quest-review";
 
 type Quest = { quest_id: string; state: string; lesson_id: string; participant_count: number; expires_at: string; version: number };
 type ApiError = { message?: string };
@@ -73,6 +74,7 @@ export function QuestStatus({ questId }: { questId: string }) {
       {quest.state === "awaiting_partner" && <><button disabled={busy} onClick={invite} className="mt-5 rounded-full bg-navy px-5 py-3 text-sm font-semibold text-white disabled:opacity-50">{busy ? "Working…" : link ? "Create a fresh invitation" : "Create invitation link"}</button>{link && <><label className="mt-4 block text-sm font-semibold" htmlFor="invite-link">Invitation link</label><input id="invite-link" readOnly value={link} className="mt-2 w-full rounded-lg border border-line bg-paper px-3 py-3 text-sm"/><button onClick={copy} className="mt-3 mr-4 rounded-full border border-line px-4 py-2 text-sm font-semibold">Copy link</button><button onClick={revoke} className="mt-3 rounded-full border border-line px-4 py-2 text-sm font-semibold">Revoke link</button></>}</>}
       {(quest.state === "preparing" || quest.state === "collaborating") && <QuestPreparation questId={questId} onQuestChanged={refreshQuest} />}
       {quest.state === "collaborating" && <QuestArtifactWorkspace questId={questId} />}
+      {(quest.state === "collaborating" || quest.state === "expired") && <QuestReviewWorkspace questId={questId} />}
       {(quest.state === "expired" || quest.state === "cancelled") && <p className="mt-4 text-sm text-muted" role="status">This quest is {quest.state} and can no longer be changed.</p>}
     </section>}
     {message && <p role="status" className="mt-4 text-sm text-muted">{message}</p>}

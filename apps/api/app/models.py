@@ -1,4 +1,5 @@
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, computed_field
 
@@ -54,7 +55,13 @@ class CourseDetail(CourseBase):
         return sum(len(level.modules) for level in self.levels)
 
 
+class ReviewableRevisionConflict(ApiModel):
+    revision_id: UUID
+    revision_number: int
+
+
 class ApiError(ApiModel):
     code: str
     message: str
     current_revision: int | None = None
+    current_reviewable_revision: ReviewableRevisionConflict | None = None

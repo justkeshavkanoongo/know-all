@@ -57,7 +57,7 @@ async def predictable_http_errors(
 ) -> JSONResponse:
     if isinstance(exc.detail, dict) and "code" in exc.detail and "message" in exc.detail:
         error = ApiError.model_validate(exc.detail)
-        return JSONResponse(status_code=exc.status_code, content=error.model_dump(exclude_none=True))
+        return JSONResponse(status_code=exc.status_code, content=error.model_dump(mode="json", exclude_none=True))
     return await http_exception_handler(request, exc)
 
 

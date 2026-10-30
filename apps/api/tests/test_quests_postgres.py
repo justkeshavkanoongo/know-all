@@ -10,12 +10,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import httpx
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,7 +23,8 @@ from app.database import dispose_engine, get_engine
 from app.main import app
 from app.quest_tables import (
     GuestIdentity, GuestSession, Invitation, Quest, QuestArtifact,
-    QuestArtifactRevision, QuestParticipant, QuestPreparationEvidence,
+    QuestArtifactRevision, QuestArtifactReview, QuestArtifactReviewResponse,
+    QuestParticipant, QuestPreparationEvidence,
 )
 from app.quests import COOKIE_NAME
 
@@ -577,3 +578,313 @@ def test_expired_collaboration_is_read_only_and_keeps_derived_expiry_semantics(t
 def authenticate_cookie_identity(db: Session, cookie: str) -> UUID:
     token_hash = hashlib.sha256(cookie.encode()).hexdigest()
     return db.scalar(select(GuestSession.identity_id).where(GuestSession.token_hash == token_hash))
+
+
+def make_review_ready(host: TestClient, partner: TestClient, quest_ids: set[UUID], key: str) -> UUID:
+    quest_id = collaborate(host, partner, quest_ids, key)
+    finish_preparation(host, quest_id)
+    finish_preparation(partner, quest_id)
+    first = _artifact_request(host, quest_id, "explanation", 0, "Use ich heiße to introduce your name.", f"{key}-host-edit")
+    second = _artifact_request(partner, quest_id, "example", 1, "Guten Tag, ich heiße Ada.", f"{key}-partner-edit")
+    assert first.status_code == second.status_code == 200
+    return quest_id
+
+
+def peer_review_body(revision_id: str) -> dict[str, object]:
+    return {
+        "revision_id": revision_id,
+        "rubric_version": "peer-review-v1",
+        "conceptual_correctness": "clear",
+        "explanation_clarity": "mostly_there",
+        "example_relevance": "clear",
+        "misconception_correction": "mostly_there",
+        "follow_up_usefulness": "needs_work",
+        "strength": "The example uses the phrase in a natural introduction.",
+        "improvement_suggestion": "Add a short translation beside the example.",
+        "rationale": "The meaning is accurate, and a translation would help a beginner follow it.",
+    }
+
+
+def post_peer_review(client: TestClient, quest_id: UUID, body: dict[str, object], key: str):
+    return client.post(
+        f"/api/quests/{quest_id}/reviews", json=body,
+        headers={"Origin": ORIGIN, "Idempotency-Key": key},
+    )
+
+
+def test_peer_reviews_are_reciprocal_revision_bound_immutable_and_one_round_only(test_database) -> None:
+    _, quest_ids = test_database
+    with TestClient(app) as host, TestClient(app) as partner:
+        quest_id = collaborate(host, partner, quest_ids, "peer-review-reciprocal")
+        finish_preparation(host, quest_id)
+        finish_preparation(partner, quest_id)
+        assert host.get(f"/api/quests/{quest_id}/reviews").json()["eligible"] is False
+        host_edit = _artifact_request(host, quest_id, "explanation", 0, "Use ich heiße to introduce your name.", "peer-host-rev")
+        partner_edit = _artifact_request(partner, quest_id, "example", 1, "Guten Tag, ich heiße Ada.", "peer-partner-rev")
+        assert host_edit.status_code == partner_edit.status_code == 200
+        host_status = host.get(f"/api/quests/{quest_id}/reviews").json()
+        partner_status = partner.get(f"/api/quests/{quest_id}/reviews").json()
+        assert host_status["eligible"] and partner_status["eligible"]
+        assert host_status["reviewable_revision"]["revision_id"] == partner_edit.json()["revision_id"]
+        assert partner_status["reviewable_revision"]["revision_id"] == host_edit.json()["revision_id"]
+
+        host_body = peer_review_body(partner_edit.json()["revision_id"])
+        submitted_host = post_peer_review(host, quest_id, host_body, "peer-host-review")
+        assert submitted_host.status_code == 200, submitted_host.text
+        assert submitted_host.json()["revision_number"] == 2
+        assert submitted_host.json()["snapshot"]["example"] == "Guten Tag, ich heiße Ada."
+        received_by_partner = partner.get(f"/api/quests/{quest_id}/reviews").json()["review_received"]
+        assert received_by_partner["review_id"] == submitted_host.json()["review_id"]
+        assert received_by_partner["strength"] == host_body["strength"]
+        replay = post_peer_review(host, quest_id, host_body, "peer-host-review")
+        assert replay.status_code == 200 and replay.json()["review_id"] == submitted_host.json()["review_id"]
+        changed_replay = dict(host_body, strength="A different strength.")
+        changed = post_peer_review(host, quest_id, changed_replay, "peer-host-review")
+        assert changed.status_code == 409 and changed.json()["code"] == "idempotency_key_reused"
+        duplicate = post_peer_review(host, quest_id, host_body, "peer-host-review-second-key")
+        assert duplicate.status_code == 409 and duplicate.json()["code"] == "review_already_submitted"
+
+        partner_body = peer_review_body(host_edit.json()["revision_id"])
+        submitted_partner = post_peer_review(partner, quest_id, partner_body, "peer-partner-review")
+        assert submitted_partner.status_code == 200, submitted_partner.text
+        assert host.get(f"/api/quests/{quest_id}/reviews").json()["review_received"]["review_id"] == submitted_partner.json()["review_id"]
+
+        later_edit = _artifact_request(partner, quest_id, "follow_up_question", 2, "Can you introduce yourself?", "peer-later-revision")
+        assert later_edit.status_code == 200
+        status = host.get(f"/api/quests/{quest_id}/reviews").json()
+        assert status["review_given"]["revision_is_current"] is False
+        assert status["review_given"]["snapshot"]["example"] == "Guten Tag, ich heiße Ada."
+        assert status["reviewable_revision"] is None
+        second_round = post_peer_review(host, quest_id, peer_review_body(later_edit.json()["revision_id"]), "peer-no-round-two")
+        assert second_round.status_code == 409 and second_round.json()["code"] == "review_already_submitted"
+        with Session(get_engine()) as db:
+            stored = db.scalar(select(QuestArtifactReview).where(QuestArtifactReview.id == UUID(submitted_host.json()["review_id"])))
+            assert stored is not None and stored.artifact_revision_id == UUID(partner_edit.json()["revision_id"])
+            with pytest.raises(DBAPIError):
+                db.execute(update(QuestArtifactReview).where(QuestArtifactReview.id == stored.id).values(strength="rewritten"))
+                db.commit()
+            db.rollback()
+            with pytest.raises(DBAPIError):
+                db.execute(delete(QuestArtifactReview).where(QuestArtifactReview.id == stored.id))
+                db.commit()
+            db.rollback()
+
+
+def test_peer_review_rejects_self_stale_and_cross_quest_access(test_database) -> None:
+    identities, quest_ids = test_database
+    with TestClient(app) as host, TestClient(app) as partner, TestClient(app) as outsider:
+        guest(outsider, identities)
+        quest_id = make_review_ready(host, partner, quest_ids, "peer-review-targets")
+        revisions = host.get(f"/api/quests/{quest_id}/artifact").json()["revisions"]
+        host_revision = next(row for row in revisions if row["author_role"] == "host")
+        partner_revision = next(row for row in revisions if row["author_role"] == "collaborator")
+        self_review = post_peer_review(host, quest_id, peer_review_body(host_revision["revision_id"]), "peer-self")
+        assert self_review.status_code == 409 and self_review.json()["code"] == "self_review_not_allowed"
+        invalid_rating = post_peer_review(host, quest_id, dict(peer_review_body(partner_revision["revision_id"]), conceptual_correctness="excellent"), "peer-invalid-rating")
+        assert invalid_rating.status_code == 422
+        forged_member = post_peer_review(host, quest_id, dict(peer_review_body(partner_revision["revision_id"]), recipient_identity_id="forged"), "peer-forged-member")
+        assert forged_member.status_code == 422
+        newer = _artifact_request(partner, quest_id, "follow_up_question", 2, "What is your name?", "peer-new-target")
+        assert newer.status_code == 200
+        stale = post_peer_review(host, quest_id, peer_review_body(partner_revision["revision_id"]), "peer-stale-target")
+        assert stale.status_code == 409 and stale.json()["code"] == "review_target_changed"
+        assert stale.json()["current_reviewable_revision"] == {
+            "revision_id": newer.json()["revision_id"],
+            "revision_number": newer.json()["revision_number"],
+        }
+        assert outsider.get(f"/api/quests/{quest_id}/reviews").status_code == 404
+        unauthorized_post = outsider.post(f"/api/quests/{quest_id}/reviews", json=peer_review_body(newer.json()["revision_id"]), headers={"Origin": ORIGIN, "Idempotency-Key": "outsider-review"})
+        assert unauthorized_post.status_code == 404
+        valid_review = post_peer_review(host, quest_id, peer_review_body(newer.json()["revision_id"]), "peer-valid-before-cross-quest")
+        assert valid_review.status_code == 200
+        other_quest_id = create_quest(partner, quest_ids, "peer-other-quest")
+        assert host.get(f"/api/quests/{other_quest_id}/reviews").status_code == 404
+        cross_quest_ack = partner.post(
+            f"/api/quests/{other_quest_id}/reviews/{valid_review.json()['review_id']}/acknowledgement",
+            json={}, headers={"Origin": ORIGIN, "Idempotency-Key": "cross-quest-ack"},
+        )
+        assert cross_quest_ack.status_code == 404
+
+        # A mismatched recipient cannot be stored, even when inserted outside the API.
+        outsider_id = next(iter(identities))
+        reviewer_id = authenticate_cookie_identity(db := Session(get_engine()), host.cookies.get(COOKIE_NAME))
+        try:
+            artifact = db.scalar(select(QuestArtifact).where(QuestArtifact.quest_id == quest_id))
+            partner_revision_row = db.get(QuestArtifactRevision, UUID(newer.json()["revision_id"]))
+            assert artifact is not None and partner_revision_row is not None
+            forged = QuestArtifactReview(
+                id=uuid4(), quest_id=quest_id, artifact_id=artifact.id,
+                artifact_revision_id=partner_revision_row.id, reviewer_identity_id=reviewer_id,
+                recipient_identity_id=outsider_id, rubric_version="peer-review-v1",
+                conceptual_correctness="clear", explanation_clarity="clear", example_relevance="clear",
+                misconception_correction="clear", follow_up_usefulness="clear", strength="A valid strength.",
+                improvement_suggestion="A valid suggestion.", rationale="A valid rationale.",
+                idempotency_key_hash="f" * 64, request_hash="e" * 64, created_at=datetime.now(timezone.utc),
+            )
+            db.add(forged)
+            with pytest.raises(IntegrityError):
+                db.flush()
+            db.rollback()
+        finally:
+            db.close()
+
+
+def test_peer_review_acknowledgement_and_response_are_authorized_write_once(test_database) -> None:
+    identities, quest_ids = test_database
+    with TestClient(app) as host, TestClient(app) as partner, TestClient(app) as outsider:
+        guest(outsider, identities)
+        quest_id = make_review_ready(host, partner, quest_ids, "peer-review-response")
+        target = host.get(f"/api/quests/{quest_id}/reviews").json()["reviewable_revision"]["revision_id"]
+        review = post_peer_review(host, quest_id, peer_review_body(target), "peer-review-for-response")
+        assert review.status_code == 200
+        review_id = review.json()["review_id"]
+        ack_url = f"/api/quests/{quest_id}/reviews/{review_id}/acknowledgement"
+        response_url = f"/api/quests/{quest_id}/reviews/{review_id}/response"
+        assert host.post(ack_url, json={}, headers={"Origin": ORIGIN, "Idempotency-Key": "wrong-recipient-ack"}).status_code == 404
+        assert outsider.post(ack_url, json={}, headers={"Origin": ORIGIN, "Idempotency-Key": "outsider-ack"}).status_code == 404
+        before_ack = partner.post(response_url, json={"response": "Thanks"}, headers={"Origin": ORIGIN, "Idempotency-Key": "reply-before-ack"})
+        assert before_ack.status_code == 409 and before_ack.json()["code"] == "review_acknowledgement_required"
+        acknowledged = partner.post(ack_url, json={}, headers={"Origin": ORIGIN, "Idempotency-Key": "review-ack"})
+        assert acknowledged.status_code == 200
+        replay_ack = partner.post(ack_url, json={}, headers={"Origin": ORIGIN, "Idempotency-Key": "review-ack"})
+        assert replay_ack.status_code == 200
+        assert datetime.fromisoformat(replay_ack.json()["acknowledged_at"]) == datetime.fromisoformat(acknowledged.json()["acknowledged_at"])
+        assert partner.post(ack_url, json={}, headers={"Origin": ORIGIN, "Idempotency-Key": "second-ack-key"}).status_code == 409
+
+        response_body = {"response": "Thank you. I will add the translation."}
+        saved_response = partner.post(response_url, json=response_body, headers={"Origin": ORIGIN, "Idempotency-Key": "review-response"})
+        assert saved_response.status_code == 200 and saved_response.json()["response_text"] == response_body["response"]
+        assert partner.post(response_url, json=response_body, headers={"Origin": ORIGIN, "Idempotency-Key": "review-response"}).status_code == 200
+        changed = partner.post(response_url, json={"response": "Changed"}, headers={"Origin": ORIGIN, "Idempotency-Key": "review-response"})
+        assert changed.status_code == 409 and changed.json()["code"] == "idempotency_key_reused"
+        assert partner.post(response_url, json={"response": "Another reply"}, headers={"Origin": ORIGIN, "Idempotency-Key": "second-response-key"}).status_code == 409
+        assert host.get(f"/api/quests/{quest_id}/reviews").json()["review_given"]["response_text"] == response_body["response"]
+        with Session(get_engine()) as db:
+            stored_review = db.get(QuestArtifactReview, UUID(review_id))
+            assert stored_review is not None
+            stored_response = db.get(QuestArtifactReviewResponse, stored_review.id)
+            assert stored_response is not None
+            with pytest.raises(DBAPIError):
+                db.execute(update(QuestArtifactReviewResponse).where(QuestArtifactReviewResponse.review_id == stored_review.id).values(acknowledged_at=datetime.now(timezone.utc)))
+                db.commit()
+            db.rollback()
+            with pytest.raises(DBAPIError):
+                db.execute(update(QuestArtifactReviewResponse).where(QuestArtifactReviewResponse.review_id == stored_review.id).values(response_text="rewritten"))
+                db.commit()
+            db.rollback()
+            with pytest.raises(DBAPIError):
+                db.execute(delete(QuestArtifactReviewResponse).where(QuestArtifactReviewResponse.review_id == stored_review.id))
+                db.commit()
+            db.rollback()
+
+
+def test_concurrent_reciprocal_reviews_and_exact_retry_are_idempotent(test_database) -> None:
+    _, quest_ids = test_database
+    with TestClient(app) as host, TestClient(app) as partner:
+        quest_id = make_review_ready(host, partner, quest_ids, "peer-review-concurrent")
+        host_target = host.get(f"/api/quests/{quest_id}/reviews").json()["reviewable_revision"]["revision_id"]
+        partner_target = partner.get(f"/api/quests/{quest_id}/reviews").json()["reviewable_revision"]["revision_id"]
+        cookies = [host.cookies.get(COOKIE_NAME), partner.cookies.get(COOKIE_NAME)]
+        assert all(cookies)
+
+        def send(args):
+            cookie, target, key = args
+            with TestClient(app) as client:
+                client.cookies.set(COOKIE_NAME, cookie)
+                return post_peer_review(client, quest_id, peer_review_body(target), key)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reciprocal = list(pool.map(send, [(cookies[0], host_target, "concurrent-host-review"), (cookies[1], partner_target, "concurrent-partner-review")]))
+        assert [response.status_code for response in reciprocal] == [200, 200]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            retries = list(pool.map(send, [(cookies[0], host_target, "concurrent-host-review")] * 2))
+        assert [response.status_code for response in retries] == [200, 200]
+        assert retries[0].json()["review_id"] == retries[1].json()["review_id"]
+        with Session(get_engine()) as db:
+            assert db.scalar(select(func.count()).select_from(QuestArtifactReview).where(QuestArtifactReview.quest_id == quest_id)) == 2
+
+
+def test_peer_review_database_failure_rolls_back_and_expiry_is_read_only(test_database) -> None:
+    _, quest_ids = test_database
+    with TestClient(app) as host, TestClient(app) as partner:
+        quest_id = make_review_ready(host, partner, quest_ids, "peer-review-rollback")
+        target = host.get(f"/api/quests/{quest_id}/reviews").json()["reviewable_revision"]["revision_id"]
+        engine = get_engine()
+        with engine.begin() as connection:
+            connection.execute(text("CREATE FUNCTION fail_peer_review_insert_for_test() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'test review insert failure'; END; $$ LANGUAGE plpgsql"))
+            connection.execute(text("CREATE TRIGGER fail_peer_review_insert_for_test BEFORE INSERT ON quest_artifact_reviews FOR EACH ROW EXECUTE FUNCTION fail_peer_review_insert_for_test()"))
+        try:
+            failed = post_peer_review(host, quest_id, peer_review_body(target), "peer-review-failure")
+            assert failed.status_code == 503
+            assert host.get(f"/api/quests/{quest_id}/reviews").json()["submitted_by_you"] is False
+            with Session(engine) as db:
+                assert db.scalar(select(func.count()).select_from(QuestArtifactReview).where(QuestArtifactReview.quest_id == quest_id)) == 0
+        finally:
+            with engine.begin() as connection:
+                connection.execute(text("DROP TRIGGER IF EXISTS fail_peer_review_insert_for_test ON quest_artifact_reviews"))
+                connection.execute(text("DROP FUNCTION IF EXISTS fail_peer_review_insert_for_test()"))
+        saved = post_peer_review(host, quest_id, peer_review_body(target), "peer-review-before-expiry")
+        assert saved.status_code == 200
+        with Session(engine) as db, db.begin():
+            quest = db.get(Quest, quest_id)
+            assert quest is not None
+            quest.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        status = host.get(f"/api/quests/{quest_id}/reviews")
+        assert status.status_code == 200 and status.json()["state"] == "expired"
+        assert status.json()["review_given"]["review_id"] == saved.json()["review_id"]
+        expired_write = post_peer_review(partner, quest_id, peer_review_body(target), "peer-review-expired-write")
+        assert expired_write.status_code == 409
+        ack = partner.post(f"/api/quests/{quest_id}/reviews/{saved.json()['review_id']}/acknowledgement", json={}, headers={"Origin": ORIGIN, "Idempotency-Key": "peer-expired-ack"})
+        assert ack.status_code == 409
+
+
+def test_peer_review_idempotent_retries_after_expiry(test_database) -> None:
+    _, quest_ids = test_database
+    with TestClient(app) as host, TestClient(app) as partner:
+        quest_id = make_review_ready(host, partner, quest_ids, "peer-review-expiry-replay")
+        host_target = host.get(f"/api/quests/{quest_id}/reviews").json()["reviewable_revision"]["revision_id"]
+        partner_target = partner.get(f"/api/quests/{quest_id}/reviews").json()["reviewable_revision"]["revision_id"]
+
+        host_body = peer_review_body(host_target)
+        host_review = post_peer_review(host, quest_id, host_body, "expiry-replay-host-review")
+        partner_review = post_peer_review(partner, quest_id, peer_review_body(partner_target), "expiry-replay-partner-review")
+        assert host_review.status_code == partner_review.status_code == 200
+
+        review_id = host_review.json()["review_id"]
+        ack_url = f"/api/quests/{quest_id}/reviews/{review_id}/acknowledgement"
+        response_url = f"/api/quests/{quest_id}/reviews/{review_id}/response"
+        ack_key = "expiry-replay-ack"
+        response_key = "expiry-replay-response"
+        response_body = {"response": "I will add the translation."}
+        acknowledged = partner.post(ack_url, json={}, headers={"Origin": ORIGIN, "Idempotency-Key": ack_key})
+        saved_response = partner.post(response_url, json=response_body, headers={"Origin": ORIGIN, "Idempotency-Key": response_key})
+        assert acknowledged.status_code == saved_response.status_code == 200
+
+        with Session(get_engine()) as db, db.begin():
+            quest = db.get(Quest, quest_id)
+            assert quest is not None
+            quest.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        review_retry = post_peer_review(host, quest_id, host_body, "expiry-replay-host-review")
+        assert review_retry.status_code == 200
+        assert review_retry.json()["review_id"] == host_review.json()["review_id"]
+        changed_review = post_peer_review(host, quest_id, dict(host_body, strength="A changed payload."), "expiry-replay-host-review")
+        assert changed_review.status_code == 409 and changed_review.json()["code"] == "idempotency_key_reused"
+        new_review = post_peer_review(host, quest_id, host_body, "expiry-replay-new-review-key")
+        assert new_review.status_code == 409 and new_review.json()["code"] == "quest_expired"
+
+        ack_retry = partner.post(ack_url, json={}, headers={"Origin": ORIGIN, "Idempotency-Key": ack_key})
+        assert ack_retry.status_code == 200
+        assert datetime.fromisoformat(ack_retry.json()["acknowledged_at"]) == datetime.fromisoformat(acknowledged.json()["acknowledged_at"])
+        malformed_ack_retry = partner.post(ack_url, json={"extra": "different payload"}, headers={"Origin": ORIGIN, "Idempotency-Key": ack_key})
+        assert malformed_ack_retry.status_code == 422
+        new_ack = partner.post(ack_url, json={}, headers={"Origin": ORIGIN, "Idempotency-Key": "expiry-replay-new-ack-key"})
+        assert new_ack.status_code == 409 and new_ack.json()["code"] == "quest_expired"
+
+        response_retry = partner.post(response_url, json=response_body, headers={"Origin": ORIGIN, "Idempotency-Key": response_key})
+        assert response_retry.status_code == 200
+        assert response_retry.json()["response_text"] == saved_response.json()["response_text"]
+        changed_response = partner.post(response_url, json={"response": "A different response."}, headers={"Origin": ORIGIN, "Idempotency-Key": response_key})
+        assert changed_response.status_code == 409 and changed_response.json()["code"] == "idempotency_key_reused"
+        new_response = partner.post(response_url, json={"response": "A new response."}, headers={"Origin": ORIGIN, "Idempotency-Key": "expiry-replay-new-response-key"})
+        assert new_response.status_code == 409 and new_response.json()["code"] == "quest_expired"

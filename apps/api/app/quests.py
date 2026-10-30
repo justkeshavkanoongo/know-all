@@ -20,12 +20,15 @@ from .practice_models import PracticeCheckRequest
 from .quest_models import (
     ArtifactResponse, ArtifactRevisionResponse, ArtifactSection, ArtifactSectionUpdate,
     ArtifactSnapshot, ErrorResponse, GuestSessionCreate, GuestSessionResponse, MisconceptionCorrection,
-    InvitationRedeem, InvitationResponse, PreparationCheckResponse,
-    PreparationMemberStatus, PreparationStatus, QuestCreate, QuestResponse,
+    InvitationRedeem, InvitationResponse, PeerReviewRequest, PeerReviewResponse,
+    PreparationCheckResponse, PreparationMemberStatus, PreparationStatus, QuestCreate,
+    QuestResponse, QuestReviewStatus, ReviewAcknowledgementRequest,
+    ReviewRecipientResponse, ReviewResponseRequest, ReviewRevisionSummary,
 )
 from .quest_tables import (
     GuestIdentity, GuestSession, IdempotencyRecord, Invitation, Quest,
-    QuestArtifact, QuestArtifactRevision, QuestParticipant, QuestPreparationEvidence,
+    QuestArtifact, QuestArtifactRevision, QuestArtifactReview,
+    QuestArtifactReviewResponse, QuestParticipant, QuestPreparationEvidence,
 )
 
 router = APIRouter(prefix="/api", tags=["guest quests"])
@@ -92,7 +95,7 @@ def quest_response(db: Session, quest: Quest) -> QuestResponse:
     actions = {
         "awaiting_partner": ["view", "invite"],
         "preparing": ["view", "prepare"],
-        "collaborating": ["view", "edit_artifact"],
+        "collaborating": ["view", "edit_artifact", "review"],
     }.get(state, [])
     return QuestResponse(quest_id=quest.id, state=state, lesson_id=quest.lesson_id,
                          concept_ids=quest.concept_ids, template_id=quest.template_id, participant_count=count,
@@ -319,14 +322,21 @@ PREPARATION_REQUIRED_COUNT = 7
 ARTIFACT_HISTORY_LIMIT = 50
 
 
-def _locked_member_quest(db: Session, quest_id: UUID, identity_id: UUID) -> tuple[Quest, QuestParticipant]:
+def _locked_member_quest(
+    db: Session, quest_id: UUID, identity_id: UUID, *, allow_expired: bool = False,
+) -> tuple[Quest, QuestParticipant]:
     quest = db.scalar(select(Quest).where(Quest.id == quest_id).with_for_update())
     participant = db.get(QuestParticipant, (quest_id, identity_id))
     if quest is None or participant is None:
         raise error(404, "quest_not_found", "Quest was not found.")
+    if not allow_expired:
+        _reject_expired_quest(quest)
+    return quest, participant
+
+
+def _reject_expired_quest(quest: Quest) -> None:
     if quest.expires_at <= now() and quest.state not in {"expired", "cancelled"}:
         raise error(409, "quest_expired", "This quest has expired.")
-    return quest, participant
 
 
 def _member_preparation_count(db: Session, quest_id: UUID, identity_id: UUID) -> int:
@@ -382,7 +392,7 @@ def _artifact_response(db: Session, quest: Quest, artifact: QuestArtifact) -> Ar
     }
     revision_models = [
         ArtifactRevisionResponse(
-            revision_number=revision.revision_number,
+            revision_id=revision.id, revision_number=revision.revision_number,
             changed_section=revision.changed_section,
             author_role="system" if revision.author_identity_id is None else roles[revision.author_identity_id],
             created_at=revision.created_at,
@@ -542,7 +552,7 @@ def update_quest_artifact_section(
         if not hmac.compare_digest(prior.request_hash or "", request_hash):
             raise error(409, "idempotency_key_reused", "This idempotency key was used for a different artifact update.")
         return ArtifactRevisionResponse(
-            revision_number=prior.revision_number, changed_section=prior.changed_section,
+            revision_id=prior.id, revision_number=prior.revision_number, changed_section=prior.changed_section,
             author_role=participant.role, created_at=prior.created_at,
             snapshot=ArtifactSnapshot.model_validate(prior.snapshot),
         )
@@ -577,6 +587,279 @@ def update_quest_artifact_section(
     artifact.current_revision = revision_number
     db.commit()
     return ArtifactRevisionResponse(
-        revision_number=revision_number, changed_section=section_id,
+        revision_id=revision.id, revision_number=revision_number, changed_section=section_id,
         author_role=participant.role, created_at=revision.created_at, snapshot=updated_snapshot,
     )
+
+
+def _peer_review_response(db: Session, quest: Quest, review: QuestArtifactReview) -> PeerReviewResponse:
+    revision = db.get(QuestArtifactRevision, review.artifact_revision_id)
+    reviewer = db.get(QuestParticipant, (quest.id, review.reviewer_identity_id))
+    recipient = db.get(QuestParticipant, (quest.id, review.recipient_identity_id))
+    if revision is None or reviewer is None or recipient is None:
+        raise error(503, "review_unavailable", "Peer feedback is temporarily unavailable.")
+    artifact = db.scalar(select(QuestArtifact).where(QuestArtifact.quest_id == quest.id))
+    interaction = db.get(QuestArtifactReviewResponse, review.id)
+    return PeerReviewResponse(
+        review_id=review.id, revision_id=revision.id, revision_number=revision.revision_number,
+        revision_is_current=artifact is not None and artifact.current_revision == revision.revision_number,
+        snapshot=ArtifactSnapshot.model_validate(revision.snapshot),
+        reviewer_role=reviewer.role, recipient_role=recipient.role, rubric_version=review.rubric_version,
+        conceptual_correctness=review.conceptual_correctness, explanation_clarity=review.explanation_clarity,
+        example_relevance=review.example_relevance, misconception_correction=review.misconception_correction,
+        follow_up_usefulness=review.follow_up_usefulness, strength=review.strength,
+        improvement_suggestion=review.improvement_suggestion, rationale=review.rationale,
+        created_at=review.created_at,
+        acknowledged_at=interaction.acknowledged_at if interaction else None,
+        response_text=interaction.response_text if interaction else None,
+        responded_at=interaction.responded_at if interaction else None,
+    )
+
+
+def _review_status(db: Session, quest: Quest, participant: QuestParticipant) -> QuestReviewStatus:
+    participants = db.scalars(select(QuestParticipant).where(QuestParticipant.quest_id == quest.id)).all()
+    partner = next((row for row in participants if row.identity_id != participant.identity_id), None)
+    state = "expired" if quest.expires_at <= now() and quest.state not in {"expired", "cancelled"} else quest.state
+    given = db.scalar(select(QuestArtifactReview).where(
+        QuestArtifactReview.quest_id == quest.id,
+        QuestArtifactReview.reviewer_identity_id == participant.identity_id,
+    ))
+    received = db.scalar(select(QuestArtifactReview).where(
+        QuestArtifactReview.quest_id == quest.id,
+        QuestArtifactReview.recipient_identity_id == participant.identity_id,
+    ))
+    authored = set(db.scalars(select(QuestArtifactRevision.author_identity_id).where(
+        QuestArtifactRevision.quest_id == quest.id,
+        QuestArtifactRevision.author_identity_id.is_not(None),
+    ))) if quest.state == "collaborating" else set()
+    eligible = quest.state == "collaborating" and quest.expires_at > now() and len(authored) == 2
+    reviewable: ReviewRevisionSummary | None = None
+    if eligible and given is None and partner is not None:
+        revision = db.scalar(select(QuestArtifactRevision).where(
+            QuestArtifactRevision.quest_id == quest.id,
+            QuestArtifactRevision.author_identity_id == partner.identity_id,
+        ).order_by(QuestArtifactRevision.revision_number.desc()).limit(1))
+        if revision is not None:
+            reviewable = ReviewRevisionSummary(
+                revision_id=revision.id, revision_number=revision.revision_number,
+                author_role=partner.role, created_at=revision.created_at,
+                snapshot=ArtifactSnapshot.model_validate(revision.snapshot),
+            )
+    return QuestReviewStatus(
+        quest_id=quest.id, current_role=participant.role, state=state,
+        eligible=eligible, submitted_by_you=given is not None,
+        submitted_by_partner=partner is not None and db.scalar(select(QuestArtifactReview.id).where(
+            QuestArtifactReview.quest_id == quest.id,
+            QuestArtifactReview.reviewer_identity_id == partner.identity_id,
+        )) is not None,
+        reviewable_revision=reviewable,
+        review_given=_peer_review_response(db, quest, given) if given else None,
+        review_received=_peer_review_response(db, quest, received) if received else None,
+    )
+
+
+def _review_idempotency_key(key: str | None) -> tuple[str, str]:
+    if not key or not key.strip() or len(key) > 128:
+        raise error(400, "idempotency_key_required", "A valid Idempotency-Key header is required.")
+    return key, digest(key)
+
+
+@router.get(
+    "/quests/{quest_id}/reviews", response_model=QuestReviewStatus,
+    responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def get_quest_reviews(quest_id: UUID, request: Request, db: Session = Depends(get_db_session)) -> QuestReviewStatus:
+    _, identity = authenticate(db, request.cookies.get(COOKIE_NAME))
+    quest, participant = member(db, quest_id, identity.id)
+    return _review_status(db, quest, participant)
+
+
+@router.post(
+    "/quests/{quest_id}/reviews", response_model=PeerReviewResponse,
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def submit_quest_review(
+    quest_id: UUID, payload: PeerReviewRequest, request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    db: Session = Depends(get_db_session),
+) -> PeerReviewResponse:
+    require_origin(request)
+    _, key_hash = _review_idempotency_key(idempotency_key)
+    _, identity = authenticate(db, request.cookies.get(COOKIE_NAME))
+    quest, participant = _locked_member_quest(db, quest_id, identity.id, allow_expired=True)
+    if quest.state != "collaborating":
+        raise error(409, "review_not_available", "Peer feedback is available after collaboration begins.")
+    body_hash = digest(payload.model_dump_json())
+    previous = db.scalar(select(QuestArtifactReview).where(
+        QuestArtifactReview.quest_id == quest.id,
+        QuestArtifactReview.reviewer_identity_id == identity.id,
+        QuestArtifactReview.idempotency_key_hash == key_hash,
+    ))
+    if previous is not None:
+        if not hmac.compare_digest(previous.request_hash, body_hash):
+            raise error(409, "idempotency_key_reused", "This idempotency key was used for a different review.")
+        return _peer_review_response(db, quest, previous)
+    _reject_expired_quest(quest)
+    if db.scalar(select(QuestArtifactReview.id).where(
+        QuestArtifactReview.quest_id == quest.id,
+        QuestArtifactReview.reviewer_identity_id == identity.id,
+    )) is not None:
+        raise error(409, "review_already_submitted", "Your first-round review has already been submitted.")
+
+    requested_revision = db.get(QuestArtifactRevision, payload.revision_id)
+    if requested_revision is not None and requested_revision.quest_id == quest.id and requested_revision.author_identity_id == identity.id:
+        raise error(409, "self_review_not_allowed", "You can only review your partner’s contribution.")
+
+    partner = db.scalar(select(QuestParticipant).where(
+        QuestParticipant.quest_id == quest.id,
+        QuestParticipant.identity_id != identity.id,
+    ))
+    artifact = db.scalar(select(QuestArtifact).where(QuestArtifact.quest_id == quest.id))
+    if partner is None or artifact is None:
+        raise error(409, "review_not_available", "Both participants must contribute before peer review begins.")
+    authors = set(db.scalars(select(QuestArtifactRevision.author_identity_id).where(
+        QuestArtifactRevision.quest_id == quest.id,
+        QuestArtifactRevision.author_identity_id.is_not(None),
+    )))
+    if len(authors) != 2:
+        raise error(409, "review_not_available", "Both participants must contribute before peer review begins.")
+    target = db.scalar(select(QuestArtifactRevision).where(
+        QuestArtifactRevision.quest_id == quest.id,
+        QuestArtifactRevision.author_identity_id == partner.identity_id,
+    ).order_by(QuestArtifactRevision.revision_number.desc()).limit(1))
+    if target is None:
+        raise error(409, "review_not_available", "Your partner has no eligible artifact revision to review.")
+    if payload.revision_id != target.id:
+        raise HTTPException(status_code=409, detail={
+            "code": "review_target_changed",
+            "message": "Your partner’s latest contribution changed. Refresh the review before submitting.",
+            "current_reviewable_revision": {
+                "revision_id": str(target.id),
+                "revision_number": target.revision_number,
+            },
+        })
+
+    review = QuestArtifactReview(
+        id=uuid4(), quest_id=quest.id, artifact_id=artifact.id, artifact_revision_id=target.id,
+        reviewer_identity_id=identity.id, recipient_identity_id=target.author_identity_id,
+        rubric_version=payload.rubric_version,
+        conceptual_correctness=payload.conceptual_correctness,
+        explanation_clarity=payload.explanation_clarity, example_relevance=payload.example_relevance,
+        misconception_correction=payload.misconception_correction,
+        follow_up_usefulness=payload.follow_up_usefulness,
+        strength=payload.strength, improvement_suggestion=payload.improvement_suggestion,
+        rationale=payload.rationale, idempotency_key_hash=key_hash, request_hash=body_hash, created_at=now(),
+    )
+    db.add(review)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise error(409, "review_already_submitted", "A review already exists for this contribution.") from exc
+    return _peer_review_response(db, quest, review)
+
+
+def _review_recipient(db: Session, quest_id: UUID, review_id: UUID, identity_id: UUID) -> tuple[Quest, QuestArtifactReview]:
+    quest, _ = _locked_member_quest(db, quest_id, identity_id, allow_expired=True)
+    review = db.scalar(select(QuestArtifactReview).where(
+        QuestArtifactReview.id == review_id,
+        QuestArtifactReview.quest_id == quest.id,
+        QuestArtifactReview.recipient_identity_id == identity_id,
+    ).with_for_update())
+    if review is None:
+        raise error(404, "review_not_found", "Peer feedback was not found.")
+    if quest.state != "collaborating":
+        raise error(409, "review_not_available", "Review responses are available during collaboration.")
+    return quest, review
+
+
+def _recipient_response(review_id: UUID, row: QuestArtifactReviewResponse) -> ReviewRecipientResponse:
+    return ReviewRecipientResponse(
+        review_id=review_id, acknowledged_at=row.acknowledged_at,
+        response_text=row.response_text, responded_at=row.responded_at,
+    )
+
+
+@router.post(
+    "/quests/{quest_id}/reviews/{review_id}/acknowledgement", response_model=ReviewRecipientResponse,
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse}},
+)
+def acknowledge_quest_review(
+    quest_id: UUID, review_id: UUID, payload: ReviewAcknowledgementRequest, request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    db: Session = Depends(get_db_session),
+) -> ReviewRecipientResponse:
+    require_origin(request)
+    _, key_hash = _review_idempotency_key(idempotency_key)
+    _, identity = authenticate(db, request.cookies.get(COOKIE_NAME))
+    quest, review = _review_recipient(db, quest_id, review_id, identity.id)
+    request_hash = digest(payload.model_dump_json())
+    collision = db.scalar(select(QuestArtifactReviewResponse).where(
+        QuestArtifactReviewResponse.quest_id == quest.id,
+        QuestArtifactReviewResponse.identity_id == identity.id,
+        QuestArtifactReviewResponse.acknowledgement_key_hash == key_hash,
+    ))
+    if collision is not None:
+        if collision.review_id != review.id or not hmac.compare_digest(collision.acknowledgement_request_hash, request_hash):
+            raise error(409, "idempotency_key_reused", "This idempotency key was used for a different action.")
+        return _recipient_response(review.id, collision)
+    _reject_expired_quest(quest)
+    existing = db.get(QuestArtifactReviewResponse, review.id)
+    if existing is not None:
+        raise error(409, "review_already_acknowledged", "This feedback has already been acknowledged.")
+    row = QuestArtifactReviewResponse(
+        review_id=review.id, quest_id=quest.id, identity_id=identity.id,
+        acknowledgement_key_hash=key_hash, acknowledgement_request_hash=request_hash,
+        acknowledged_at=now(),
+    )
+    db.add(row)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise error(409, "idempotency_key_reused", "This idempotency key was already used.") from exc
+    return _recipient_response(review.id, row)
+
+
+@router.post(
+    "/quests/{quest_id}/reviews/{review_id}/response", response_model=ReviewRecipientResponse,
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse}},
+)
+def respond_to_quest_review(
+    quest_id: UUID, review_id: UUID, payload: ReviewResponseRequest, request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    db: Session = Depends(get_db_session),
+) -> ReviewRecipientResponse:
+    require_origin(request)
+    _, key_hash = _review_idempotency_key(idempotency_key)
+    _, identity = authenticate(db, request.cookies.get(COOKIE_NAME))
+    quest, review = _review_recipient(db, quest_id, review_id, identity.id)
+    row = db.get(QuestArtifactReviewResponse, review.id)
+    if row is None:
+        raise error(409, "review_acknowledgement_required", "Acknowledge the feedback before responding.")
+    request_hash = digest(payload.model_dump_json())
+    collision = db.scalar(select(QuestArtifactReviewResponse).where(
+        QuestArtifactReviewResponse.quest_id == quest.id,
+        QuestArtifactReviewResponse.identity_id == identity.id,
+        QuestArtifactReviewResponse.response_key_hash == key_hash,
+    ))
+    if collision is not None:
+        if collision.review_id != review.id or not hmac.compare_digest(collision.response_request_hash or "", request_hash):
+            raise error(409, "idempotency_key_reused", "This idempotency key was used for a different action.")
+        return _recipient_response(review.id, collision)
+    _reject_expired_quest(quest)
+    if row.response_text is not None:
+        raise error(409, "review_response_already_submitted", "A response to this feedback has already been submitted.")
+    row.response_text = payload.response
+    row.response_key_hash = key_hash
+    row.response_request_hash = request_hash
+    row.responded_at = now()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise error(409, "idempotency_key_reused", "This idempotency key was already used.") from exc
+    return _recipient_response(review.id, row)

@@ -607,3 +607,17 @@ def test_assessment_openapi_documents_public_attempt_and_submit_schemas() -> Non
     assert "InternalMultipleChoiceQuestion" not in schemas
     assert "InternalMatchingQuestion" not in schemas
     assert "InternalFillBlankQuestion" not in schemas
+
+
+def test_peer_review_openapi_documents_revision_bound_contracts() -> None:
+    paths = app.openapi()["paths"]
+    review_collection = paths["/api/quests/{quest_id}/reviews"]
+    assert review_collection["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].endswith("QuestReviewStatus")
+    submit = review_collection["post"]
+    assert submit["requestBody"]["content"]["application/json"]["schema"]["$ref"].endswith("PeerReviewRequest")
+    assert submit["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].endswith("PeerReviewResponse")
+    assert "409" in submit["responses"]
+    acknowledge = paths["/api/quests/{quest_id}/reviews/{review_id}/acknowledgement"]["post"]
+    respond = paths["/api/quests/{quest_id}/reviews/{review_id}/response"]["post"]
+    assert acknowledge["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].endswith("ReviewRecipientResponse")
+    assert respond["requestBody"]["content"]["application/json"]["schema"]["$ref"].endswith("ReviewResponseRequest")
